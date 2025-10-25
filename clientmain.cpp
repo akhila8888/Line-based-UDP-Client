@@ -1,291 +1,344 @@
-#include <iostream>
-#include <string>
-#include <cstring>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <sys/socket.h>
-#include <sys/time.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/select.h>
+#include <string>
+#include "protocol.h"
+#include <endian.h>
 
-#include "protocol.h" // Provided in the repo
-#include "calcLib.h"  // Provided support library
+#ifdef DEBUG
+#define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINT(...)
+#endif
 
+#define MSG_SIZE sizeof(struct calcMessage)
+#define PROTO_SIZE sizeof(struct calcProtocol)
 #define TIMEOUT_SEC 2
-#define MAX_RETRIES 3
+#define MAX_ATTEMPTS 3
+#define PROTOCOL_ID 17
+#define MAJOR_VERSION 1
+#define MINOR_VERSION 0
+#define CLIENT_MSG_TYPE 22
+#define SERVER_MSG_TYPE 2
+#define SERVER_PROTO_TYPE 1
+#define CLIENT_PROTO_TYPE 2
+#define MSG_NA 0
+#define MSG_OK 1
+#define MSG_NOK 2
+
+std::string op_to_string(uint32_t op)
+{
+  switch (op)
+  {
+  case 1:
+    return "add";
+  case 2:
+    return "sub";
+  case 3:
+    return "mul";
+  case 4:
+    return "div";
+  case 5:
+    return "fadd";
+  case 6:
+    return "fsub";
+  case 7:
+    return "fmul";
+  case 8:
+    return "fdiv";
+  default:
+    return "unknown";
+  }
+}
+
+int32_t compute_int(uint32_t op, int32_t a, int32_t b)
+{
+  switch (op)
+  {
+  case 1:
+    return a + b;
+  case 2:
+    return a - b;
+  case 3:
+    return a * b;
+  case 4:
+    return (b != 0 ? a / b : 0);
+  default:
+    return 0;
+  }
+}
+
+double compute_float(uint32_t op, double a, double b)
+{
+  switch (op)
+  {
+  case 5:
+    return a + b;
+  case 6:
+    return a - b;
+  case 7:
+    return a * b;
+  case 8:
+    return (b != 0.0 ? a / b : 0.0);
+  default:
+    return 0.0;
+  }
+}
+
+int send_with_timeout(int sockfd, const void *send_buf, size_t send_len,
+                      void *recv_buf, size_t *recv_len,
+                      const struct sockaddr *dest_addr, socklen_t dest_len)
+{
+  char recv_buffer[1024];
+  for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
+  {
+    if (sendto(sockfd, send_buf, send_len, 0, dest_addr, dest_len) < 0)
+    {
+      perror("sendto");
+      return -1;
+    }
+
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(sockfd, &read_fds);
+    struct timeval timeout = {TIMEOUT_SEC, 0};
+
+    int sel = select(sockfd + 1, &read_fds, NULL, NULL, &timeout);
+    if (sel < 0)
+    {
+      perror("select");
+      return -1;
+    }
+    else if (sel == 0)
+    {
+      continue; // timeout, retry
+    }
+
+    ssize_t received = recvfrom(sockfd, recv_buffer, sizeof(recv_buffer), 0, NULL, NULL);
+    if (received <= 0)
+      continue;
+
+    memcpy(recv_buf, recv_buffer, received);
+    *recv_len = (size_t)received;
+    return 0;
+  }
+  return -1;
+}
 
 int main(int argc, char *argv[])
 {
   if (argc != 2)
   {
-    std::cerr << "Usage: ./client <host:port>" << std::endl;
+    fprintf(stderr, "Usage: %s <host:port>\n", argv[0]);
     return 1;
   }
 
-  // ---------------------------
-  // Parse host:port
-  // ---------------------------
-  std::string arg = argv[1];
-  size_t pos = arg.find(':');
-  if (pos == std::string::npos)
+  char *endpoint = argv[1];
+  char *colon = strrchr(endpoint, ':');
+  if (!colon)
   {
-    std::cerr << "Invalid input. Format: <host:port>" << std::endl;
+    fprintf(stderr, "Invalid endpoint format. Use host:port\n");
+    return 1;
+  }
+  *colon = '\0';
+  char *host = endpoint;
+  char *port_str = colon + 1;
+  int port = atoi(port_str);
+  printf("Host %s, and port %d.\n", host, port);
+
+  struct addrinfo hints = {0};
+  hints.ai_family = AF_UNSPEC; // IPv4 or IPv6
+  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_protocol = IPPROTO_UDP;
+
+  struct addrinfo *server_addr;
+  int err = getaddrinfo(host, port_str, &hints, &server_addr);
+  if (err != 0)
+  {
+    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err));
     return 1;
   }
 
-  std::string host = arg.substr(0, pos);
-  std::string port = arg.substr(pos + 1);
-
-  std::cout << "Host " << host << ", and port " << port << "." << std::endl;
-
-  // ---------------------------
-  // Resolve address (IPv4 or IPv6)
-  // ---------------------------
-  struct addrinfo hints{}, *res, *p;
-  hints.ai_family = AF_UNSPEC;    // Allow both IPv4 and IPv6
-  hints.ai_socktype = SOCK_DGRAM; // UDP
-
-  int status = getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
-  if (status != 0)
+  int sockfd = socket(server_addr->ai_family, SOCK_DGRAM, 0);
+  if (sockfd < 0)
   {
-    std::cerr << "getaddrinfo: " << gai_strerror(status) << std::endl;
+    perror("socket");
+    freeaddrinfo(server_addr);
     return 1;
   }
 
-  int sockfd = -1;
-  struct addrinfo *dest = nullptr;
-  for (p = res; p != nullptr; p = p->ai_next)
-  {
-    sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-    if (sockfd == -1)
-      continue;
-    dest = p;
-    break;
-  }
+  // Prepare initial calcMessage
+  struct calcMessage request;
+  request.type = htons(CLIENT_MSG_TYPE);
+  request.message = htonl(MSG_NA);
+  request.protocol = htons(PROTOCOL_ID);
+  request.major_version = htons(MAJOR_VERSION);
+  request.minor_version = htons(MINOR_VERSION);
 
-  if (sockfd < 0 || !dest)
+  char send_buf[MSG_SIZE];
+  memcpy(send_buf, &request, MSG_SIZE);
+  char recv_buf[1024];
+  size_t recv_size;
+
+  if (send_with_timeout(sockfd, send_buf, MSG_SIZE, recv_buf, &recv_size,
+                        server_addr->ai_addr, server_addr->ai_addrlen) < 0)
   {
-    std::cerr << "Failed to create socket" << std::endl;
-    freeaddrinfo(res);
+    printf("the server did not reply\n");
+    close(sockfd);
+    freeaddrinfo(server_addr);
     return 1;
   }
 
-  // ---------------------------
-  // Set 2-second receive timeout
-  // ---------------------------
-  struct timeval tv;
-  tv.tv_sec = TIMEOUT_SEC;
-  tv.tv_usec = 0;
-  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-#ifdef DEBUG
-  char hostip[INET6_ADDRSTRLEN];
-  void *addrptr = nullptr;
-  if (dest->ai_family == AF_INET)
-    addrptr = &((struct sockaddr_in *)dest->ai_addr)->sin_addr;
-  else
-    addrptr = &((struct sockaddr_in6 *)dest->ai_addr)->sin6_addr;
-  inet_ntop(dest->ai_family, addrptr, hostip, sizeof(hostip));
-  std::cout << "Resolved " << host << " to " << hostip << std::endl;
-#endif
-
-  // ---------------------------
-  // Build initial calcMessage
-  // ---------------------------
-  calcMessage msg{};
-  msg.type = htons(22);
-  msg.message = htons(0);
-  msg.protocol = htons(17);
-  msg.major_version = htons(1);
-  msg.minor_version = htons(0);
-
-  // ---------------------------
-  // Send initial calcMessage (with retries)
-  // ---------------------------
-  int retries = 0;
-  bool gotReply = false;
-
-  while (retries < MAX_RETRIES && !gotReply)
+  if (recv_size != MSG_SIZE && recv_size != PROTO_SIZE)
   {
-    ssize_t sent = sendto(sockfd, &msg, sizeof(msg), 0, dest->ai_addr, dest->ai_addrlen);
-    if (sent < 0)
+    printf("ERROR WRONG SIZE OR INCORRECT PROTOCOL\n");
+    close(sockfd);
+    freeaddrinfo(server_addr);
+    return 1;
+  }
+
+  // Server sent calcMessage (NOT OK)
+  if (recv_size == MSG_SIZE)
+  {
+    struct calcMessage resp;
+    memcpy(&resp, recv_buf, MSG_SIZE);
+    resp.type = ntohs(resp.type);
+    resp.message = ntohl(resp.message);
+    resp.protocol = ntohs(resp.protocol);
+    resp.major_version = ntohs(resp.major_version);
+    resp.minor_version = ntohs(resp.minor_version);
+
+    if (resp.type == SERVER_MSG_TYPE && resp.message == MSG_NOK)
     {
-      perror("sendto");
-      freeaddrinfo(res);
+      printf("the server sent a 'NOT OK' message\n");
       close(sockfd);
-      return 1;
-    }
-
-#ifdef DEBUG
-    std::cout << "Sent calcMessage (" << sent << " bytes)" << std::endl;
-#endif
-
-    calcProtocol proto{};
-    ssize_t n = recvfrom(sockfd, &proto, sizeof(proto), 0, nullptr, nullptr);
-    if (n < 0)
-    {
-      retries++;
-#ifdef DEBUG
-      std::cout << "Timeout, retry " << retries << "/" << MAX_RETRIES << std::endl;
-#endif
-    }
-    else if ((size_t)n != sizeof(proto))
-    {
-      std::cerr << "ERROR WRONG SIZE OR INCORRECT PROTOCOL" << std::endl;
-      freeaddrinfo(res);
-      close(sockfd);
+      freeaddrinfo(server_addr);
       return 1;
     }
     else
     {
-      gotReply = true;
-#ifdef DEBUG
-      std::cout << "Received calcProtocol (" << n << " bytes)" << std::endl;
-#endif
-
-      // Convert from network to host byte order
-      proto.type = ntohs(proto.type);
-      proto.major_version = ntohs(proto.major_version);
-      proto.minor_version = ntohs(proto.minor_version);
-      proto.id = ntohl(proto.id);
-      proto.arith = ntohl(proto.arith);
-
-      proto.inValue1 = ntohl(proto.inValue1);
-      proto.inValue2 = ntohl(proto.inValue2);
-      proto.inResult = ntohl(proto.inResult);
-
-      // ---------------------------
-      // Interpret the assignment
-      // ---------------------------
-      double result = 0.0;
-      std::string op;
-      bool isFloat = false;
-
-      if (proto.arith >= 1 && proto.arith <= 4)
-      { // Integer operations
-        switch (proto.arith)
-        {
-        case 1:
-          op = "add";
-          result = proto.inValue1 + proto.inValue2;
-          break;
-        case 2:
-          op = "sub";
-          result = proto.inValue1 - proto.inValue2;
-          break;
-        case 3:
-          op = "mul";
-          result = proto.inValue1 * proto.inValue2;
-          break;
-        case 4:
-          op = "div";
-          result = (proto.inValue2 != 0) ? (double)proto.inValue1 / proto.inValue2 : 0.0;
-          break;
-        }
-        isFloat = false;
-        proto.inResult = htonl((int32_t)result);
-      }
-      else
-      { // Floating operations
-        switch (proto.arith)
-        {
-        case 5:
-          op = "fadd";
-          result = proto.flValue1 + proto.flValue2;
-          break;
-        case 6:
-          op = "fsub";
-          result = proto.flValue1 - proto.flValue2;
-          break;
-        case 7:
-          op = "fmul";
-          result = proto.flValue1 * proto.flValue2;
-          break;
-        case 8:
-          op = "fdiv";
-          result = proto.flValue2 != 0 ? proto.flValue1 / proto.flValue2 : 0.0;
-          break;
-        }
-        isFloat = true;
-        proto.flResult = result;
-      }
-
-      std::cout << "ASSIGNMENT: " << op << " "
-                << (isFloat ? proto.flValue1 : (double)proto.inValue1) << " "
-                << (isFloat ? proto.flValue2 : (double)proto.inValue2) << std::endl;
-
-#ifdef DEBUG
-      std::cout << "Calculated the result to " << result << std::endl;
-#endif
-
-      // Convert back to network byte order for sending
-      proto.type = htons(proto.type);
-      proto.major_version = htons(proto.major_version);
-      proto.minor_version = htons(proto.minor_version);
-      proto.id = htonl(proto.id);
-      proto.arith = htonl(proto.arith);
-
-      // ---------------------------
-      // Send result to server (with retries)
-      // ---------------------------
-      int resRetries = 0;
-      bool resAck = false;
-      calcMessage replyMsg{};
-
-      while (resRetries < MAX_RETRIES && !resAck)
-      {
-        sendto(sockfd, &proto, sizeof(proto), 0, dest->ai_addr, dest->ai_addrlen);
-#ifdef DEBUG
-        std::cout << "Sent result packet" << std::endl;
-#endif
-
-        ssize_t rn = recvfrom(sockfd, &replyMsg, sizeof(replyMsg), 0, nullptr, nullptr);
-        if (rn < 0)
-        {
-          resRetries++;
-#ifdef DEBUG
-          std::cout << "Timeout waiting for OK/NOT OK, retry "
-                    << resRetries << "/" << MAX_RETRIES << std::endl;
-#endif
-        }
-        else if ((size_t)rn != sizeof(replyMsg))
-        {
-          std::cerr << "ERROR WRONG SIZE OR INCORRECT PROTOCOL" << std::endl;
-          freeaddrinfo(res);
-          close(sockfd);
-          return 1;
-        }
-        else
-        {
-          replyMsg.type = ntohs(replyMsg.type);
-          replyMsg.message = ntohs(replyMsg.message);
-          replyMsg.major_version = ntohs(replyMsg.major_version);
-          replyMsg.minor_version = ntohs(replyMsg.minor_version);
-
-          if (replyMsg.type == 2 && replyMsg.message == 2)
-          {
-            std::cout << "NOT OK (myresult=" << result << ")" << std::endl;
-          }
-          else
-          {
-            std::cout << "OK (myresult=" << result << ")" << std::endl;
-          }
-          resAck = true;
-        }
-      }
-
-      if (!resAck)
-      {
-        std::cerr << "Server did not reply after 3 attempts." << std::endl;
-      }
+      printf("ERROR WRONG SIZE OR INCORRECT PROTOCOL\n");
+      close(sockfd);
+      freeaddrinfo(server_addr);
+      return 1;
     }
   }
 
-  if (!gotReply)
+  // Server sent calcProtocol
+  struct calcProtocol task;
+  memcpy(&task, recv_buf, PROTO_SIZE);
+  task.type = ntohs(task.type);
+  task.major_version = ntohs(task.major_version);
+  task.minor_version = ntohs(task.minor_version);
+  task.id = ntohl(task.id);
+  task.arith = ntohl(task.arith);
+
+  int32_t h_in1 = (int32_t)ntohl(*(uint32_t *)&task.inValue1);
+  int32_t h_in2 = (int32_t)ntohl(*(uint32_t *)&task.inValue2);
+  double h_fl1 = task.flValue1;
+  double h_fl2 = task.flValue2;
+
+  if (task.type != SERVER_PROTO_TYPE ||
+      task.major_version != MAJOR_VERSION ||
+      task.minor_version != MINOR_VERSION)
   {
-    std::cerr << "Server did not reply after 3 attempts." << std::endl;
+    printf("ERROR WRONG SIZE OR INCORRECT PROTOCOL\n");
+    close(sockfd);
+    freeaddrinfo(server_addr);
+    return 1;
   }
 
-  freeaddrinfo(res);
+  bool is_float_op = (task.arith >= 5 && task.arith <= 8);
+  int32_t res_int = 0;
+  double res_float = 0.0;
+
+  if (is_float_op)
+    res_float = compute_float(task.arith, h_fl1, h_fl2);
+  else
+    res_int = compute_int(task.arith, h_in1, h_in2);
+
+  std::string op_str = op_to_string(task.arith);
+  printf("ASSIGNMENT: %s ", op_str.c_str());
+  if (is_float_op)
+    printf("%8.8g %8.8g\n", h_fl1, h_fl2);
+  else
+    printf("%d %d\n", h_in1, h_in2);
+
+  DEBUG_PRINT("Calculated the result to %s\n", is_float_op ? std::to_string(res_float).c_str() : std::to_string(res_int).c_str());
+
+  // Send response
+  struct calcProtocol response;
+  response.type = htons(CLIENT_PROTO_TYPE);
+  response.major_version = htons(MAJOR_VERSION);
+  response.minor_version = htons(MINOR_VERSION);
+  response.id = htonl(task.id);
+  response.arith = htonl(task.arith);
+  *(uint32_t *)&response.inValue1 = htonl((uint32_t)h_in1);
+  *(uint32_t *)&response.inValue2 = htonl((uint32_t)h_in2);
+  *(uint32_t *)&response.inResult = htonl((uint32_t)res_int);
+  response.flValue1 = h_fl1;
+  response.flValue2 = h_fl2;
+  response.flResult = res_float;
+
+  char response_buf[PROTO_SIZE];
+  memcpy(response_buf, &response, PROTO_SIZE);
+
+  size_t final_recv_size;
+  if (send_with_timeout(sockfd, response_buf, PROTO_SIZE, recv_buf, &final_recv_size,
+                        server_addr->ai_addr, server_addr->ai_addrlen) < 0)
+  {
+    printf("the server did not reply\n");
+    close(sockfd);
+    freeaddrinfo(server_addr);
+    return 1;
+  }
+
+  if (final_recv_size != MSG_SIZE)
+  {
+    printf("ERROR WRONG SIZE OR INCORRECT PROTOCOL\n");
+    close(sockfd);
+    freeaddrinfo(server_addr);
+    return 1;
+  }
+
+  struct calcMessage final_resp;
+  memcpy(&final_resp, recv_buf, MSG_SIZE);
+  final_resp.type = ntohs(final_resp.type);
+  final_resp.message = ntohl(final_resp.message);
+  final_resp.protocol = ntohs(final_resp.protocol);
+  final_resp.major_version = ntohs(final_resp.major_version);
+  final_resp.minor_version = ntohs(final_resp.minor_version);
+
+  if (final_resp.protocol != PROTOCOL_ID ||
+      final_resp.major_version != MAJOR_VERSION ||
+      final_resp.minor_version != MINOR_VERSION)
+  {
+    printf("ERROR WRONG SIZE OR INCORRECT PROTOCOL\n");
+    close(sockfd);
+    freeaddrinfo(server_addr);
+    return 1;
+  }
+
+  if (final_resp.type == SERVER_MSG_TYPE && final_resp.message == MSG_OK)
+  {
+    printf("OK (myresult=");
+    if (is_float_op)
+      printf("%8.8g", res_float);
+    else
+      printf("%d", res_int);
+    printf(")\n");
+  }
+  else
+  {
+    printf("the server sent a 'NOT OK' message\n");
+  }
+
   close(sockfd);
+  freeaddrinfo(server_addr);
   return 0;
 }
