@@ -1,345 +1,310 @@
 #include <iostream>
-#include <string>
-#include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <netdb.h>
+#include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/select.h>
-
-#include <calcLib.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include "protocol.h"
 
 #ifdef DEBUG
-#define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#define DEBUG_PRINT(x) std::cout << x << std::endl
 #else
-#define DEBUG_PRINT(...)
+#define DEBUG_PRINT(x)
 #endif
 
-constexpr size_t MSG_SIZE = sizeof(calcMessage);
-constexpr size_t PROTO_SIZE = sizeof(calcProtocol);
-constexpr int TIMEOUT_SEC = 2;
-constexpr int MAX_ATTEMPTS = 3;
+#define MAX_BUF 1024
 
-std::string op_to_string(uint32_t op)
+// Helper function for byte-order conversion
+static inline void host_to_network(calcMessage &msg)
 {
-  switch (op)
+  msg.type = htons(msg.type);
+  msg.message = htons(msg.message);
+  msg.protocol = htons(msg.protocol);
+  msg.major_version = htons(msg.major_version);
+  msg.minor_version = htons(msg.minor_version);
+}
+
+static inline void network_to_host(calcMessage &msg)
+{
+  msg.type = ntohs(msg.type);
+  msg.message = ntohs(msg.message);
+  msg.protocol = ntohs(msg.protocol);
+  msg.major_version = ntohs(msg.major_version);
+  msg.minor_version = ntohs(msg.minor_version);
+}
+
+static inline void network_to_host(calcProtocol &msg)
+{
+  msg.type = ntohs(msg.type);
+  msg.major_version = ntohs(msg.major_version);
+  msg.minor_version = ntohs(msg.minor_version);
+  msg.id = ntohl(msg.id);
+  msg.arith = ntohl(msg.arith);
+  msg.inValue1 = ntohl(msg.inValue1);
+  msg.inValue2 = ntohl(msg.inValue2);
+  msg.inResult = ntohl(msg.inResult);
+  // doubles don’t need byte order conversion for this assignment
+}
+
+// Perform calculation from assignment
+static void calculate_result(calcProtocol &cp)
+{
+  switch (cp.arith)
   {
   case 1:
-    return "add";
+    cp.inResult = cp.inValue1 + cp.inValue2;
+    break; // ADD
   case 2:
-    return "sub";
+    cp.inResult = cp.inValue1 - cp.inValue2;
+    break; // SUB
   case 3:
-    return "mul";
+    cp.inResult = cp.inValue1 * cp.inValue2;
+    break; // MUL
   case 4:
-    return "div";
+    cp.inResult = cp.inValue1 / cp.inValue2;
+    break; // DIV
   case 5:
-    return "fadd";
+    cp.flResult = cp.flValue1 + cp.flValue2;
+    break;
   case 6:
-    return "fsub";
+    cp.flResult = cp.flValue1 - cp.flValue2;
+    break;
   case 7:
-    return "fmul";
+    cp.flResult = cp.flValue1 * cp.flValue2;
+    break;
   case 8:
-    return "fdiv";
+    cp.flResult = cp.flValue1 / cp.flValue2;
+    break;
   default:
-    return "unknown";
+    std::cerr << "Unknown operation\n";
+    break;
   }
-}
-
-int32_t compute_int(uint32_t op, int32_t a, int32_t b)
-{
-  switch (op)
-  {
-  case 1:
-    return a + b;
-  case 2:
-    return a - b;
-  case 3:
-    return a * b;
-  case 4:
-    return b ? a / b : 0;
-  default:
-    return 0;
-  }
-}
-
-double compute_float(uint32_t op, double a, double b)
-{
-  switch (op)
-  {
-  case 5:
-    return a + b;
-  case 6:
-    return a - b;
-  case 7:
-    return a * b;
-  case 8:
-    return b ? a / b : 0.0;
-  default:
-    return 0.0;
-  }
-}
-
-// Send data with timeout and retries
-int send_with_timeout(int sockfd, const void *send_buf, size_t send_len,
-                      void *recv_buf, size_t *recv_len,
-                      const sockaddr *dest_addr, socklen_t dest_len)
-{
-  std::vector<char> tmp_buf(1024);
-
-  for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
-  {
-    if (sendto(sockfd, send_buf, send_len, 0, dest_addr, dest_len) < 0)
-    {
-      perror("sendto");
-      return -1;
-    }
-
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(sockfd, &read_fds);
-    timeval timeout{TIMEOUT_SEC, 0};
-
-    int sel = select(sockfd + 1, &read_fds, nullptr, nullptr, &timeout);
-    if (sel < 0)
-    {
-      perror("select");
-      return -1;
-    }
-    if (sel == 0)
-      continue; // timeout, retry
-
-    ssize_t received = recvfrom(sockfd, tmp_buf.data(), tmp_buf.size(), 0, nullptr, nullptr);
-    if (received <= 0)
-      continue;
-
-    std::memcpy(recv_buf, tmp_buf.data(), received);
-    *recv_len = static_cast<size_t>(received);
-    return 0;
-  }
-  return -1; // no response after retries
 }
 
 int main(int argc, char *argv[])
 {
   if (argc != 2)
   {
-    std::cerr << "Usage: " << argv[0] << " <host:port>\n";
-    return 1;
+    std::cerr << "Usage: " << argv[0] << " host:port\n";
+    return EXIT_FAILURE;
   }
 
-  char *endpoint = argv[1];
-  char *colon = strrchr(endpoint, ':');
-  if (!colon)
+  std::string arg(argv[1]);
+  auto pos = arg.find(':');
+  if (pos == std::string::npos)
   {
-    std::cerr << "Invalid endpoint format. Use host:port\n";
-    return 1;
+    std::cerr << "Invalid format. Use host:port\n";
+    return EXIT_FAILURE;
   }
 
-  *colon = '\0';
-  const char *host = endpoint;
-  const char *port_str = colon + 1;
-  int port = std::atoi(port_str);
+  std::string host = arg.substr(0, pos);
+  std::string port = arg.substr(pos + 1);
 
-  std::cout << "Host " << host << ", and port " << port << ".\n";
+  std::cout << "Host " << host << ", and port " << port << "." << std::endl;
 
-  // Resolve server address
-  addrinfo hints{};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_DGRAM;
-  addrinfo *server_addr;
-  if (int err = getaddrinfo(host, port_str, &hints, &server_addr); err != 0)
+  struct addrinfo hints{}, *res, *rp;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;    // IPv4 or IPv6
+  hints.ai_socktype = SOCK_DGRAM; // UDP
+
+  int ret = getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
+  if (ret != 0)
   {
-    std::cerr << "getaddrinfo: " << gai_strerror(err) << "\n";
-    return 1;
+    std::cerr << "getaddrinfo: " << gai_strerror(ret) << std::endl;
+    return EXIT_FAILURE;
   }
 
-  int sockfd = socket(server_addr->ai_family, SOCK_DGRAM, 0);
-  if (sockfd < 0)
+  int sockfd = -1;
+  for (rp = res; rp != nullptr; rp = rp->ai_next)
   {
-    perror("socket");
-    freeaddrinfo(server_addr);
-    return 1;
+    sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    if (sockfd == -1)
+      continue;
+    break;
   }
 
-  // Bind to any local address
-  addrinfo local_hints{};
-  local_hints.ai_family = AF_UNSPEC;
-  local_hints.ai_socktype = SOCK_DGRAM;
-  local_hints.ai_flags = AI_PASSIVE;
-
-  addrinfo *local_addr;
-  if (int err = getaddrinfo(nullptr, "0", &local_hints, &local_addr); err != 0)
+  if (rp == nullptr)
   {
-    std::cerr << "getaddrinfo local: " << gai_strerror(err) << "\n";
-    close(sockfd);
-    freeaddrinfo(server_addr);
-    return 1;
-  }
-  if (bind(sockfd, local_addr->ai_addr, local_addr->ai_addrlen) < 0)
-  {
-    perror("bind");
-    freeaddrinfo(local_addr);
-    freeaddrinfo(server_addr);
-    close(sockfd);
-    return 1;
-  }
-  freeaddrinfo(local_addr);
-
-  // Initial calcMessage
-  calcMessage request{};
-  request.type = htons(22);
-  request.message = htonl(0);
-  request.protocol = htons(17);
-  request.major_version = htons(1);
-  request.minor_version = htons(0);
-
-  char send_buf[MSG_SIZE];
-  std::memcpy(send_buf, &request, MSG_SIZE);
-
-  char recv_buf[1024];
-  size_t recv_size{};
-  if (send_with_timeout(sockfd, send_buf, MSG_SIZE, recv_buf, &recv_size, server_addr->ai_addr, server_addr->ai_addrlen) < 0)
-  {
-    std::cout << "the server did not reply\n";
-    close(sockfd);
-    freeaddrinfo(server_addr);
-    return 1;
+    std::cerr << "Could not create socket" << std::endl;
+    freeaddrinfo(res);
+    return EXIT_FAILURE;
   }
 
-  if (recv_size != MSG_SIZE && recv_size != PROTO_SIZE)
-  {
-    std::cout << "ERROR WRONG SIZE OR INCORRECT PROTOCOL\n";
-    close(sockfd);
-    freeaddrinfo(server_addr);
-    return 1;
-  }
+  DEBUG_PRINT("Socket created successfully.");
 
-  // Handle calcMessage from server (NOT OK)
-  if (recv_size == MSG_SIZE)
-  {
-    calcMessage resp;
-    std::memcpy(&resp, recv_buf, MSG_SIZE);
-    resp.type = ntohs(resp.type);
-    resp.message = ntohl(resp.message);
-    resp.protocol = ntohs(resp.protocol);
-    resp.major_version = ntohs(resp.major_version);
-    resp.minor_version = ntohs(resp.minor_version);
+  // Timeout (already passed your test but keeping it consistent)
+  struct timeval tv{2, 0};
+  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    if (resp.protocol != 17 || resp.major_version != 1 || resp.minor_version != 0)
+  // Send initial calcMessage
+  calcMessage cm{};
+  cm.type = 22;
+  cm.message = 0;
+  cm.protocol = 17;
+  cm.major_version = 1;
+  cm.minor_version = 0;
+
+  calcMessage cm_send = cm;
+  host_to_network(cm_send);
+
+  int attempts = 0;
+  ssize_t n;
+  struct sockaddr_storage src_addr{};
+  socklen_t addrlen = sizeof(src_addr);
+  char buffer[MAX_BUF];
+
+  while (attempts < 3)
+  {
+    sendto(sockfd, &cm_send, sizeof(cm_send), 0, rp->ai_addr, rp->ai_addrlen);
+    n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
+                 (struct sockaddr *)&src_addr, &addrlen);
+    if (n < 0)
     {
-      std::cout << "ERROR WRONG SIZE OR INCORRECT PROTOCOL\n";
-      close(sockfd);
-      freeaddrinfo(server_addr);
-      return 1;
+      DEBUG_PRINT("Timeout waiting for response, retrying...");
+      attempts++;
+      continue;
     }
+    break;
+  }
 
-    if (resp.type == 2 && resp.message == 2)
-      std::cout << "the server sent a 'NOT OK' message\n";
+  if (attempts == 3)
+  {
+    std::cerr << "Server did not reply after 3 attempts." << std::endl;
+    freeaddrinfo(res);
+    close(sockfd);
+    return EXIT_FAILURE;
+  }
+
+  // Determine which message we received
+  if (n == sizeof(calcMessage))
+  {
+    calcMessage resp{};
+    memcpy(&resp, buffer, sizeof(calcMessage));
+    network_to_host(resp);
+
+    if (resp.message == 2)
+    {
+      std::cerr << "Server replied NOT OK (unsupported protocol)." << std::endl;
+      freeaddrinfo(res);
+      close(sockfd);
+      return EXIT_FAILURE;
+    }
     else
-      std::cout << "ERROR WRONG SIZE OR INCORRECT PROTOCOL\n";
-    close(sockfd);
-    freeaddrinfo(server_addr);
-    return 1;
+    {
+      std::cerr << "ERROR WRONG SIZE OR INCORRECT PROTOCOL" << std::endl;
+      freeaddrinfo(res);
+      close(sockfd);
+      return EXIT_FAILURE;
+    }
   }
-
-  // Handle calcProtocol assignment
-  calcProtocol task;
-  std::memcpy(&task, recv_buf, PROTO_SIZE);
-  task.type = ntohs(task.type);
-  task.major_version = ntohs(task.major_version);
-  task.minor_version = ntohs(task.minor_version);
-  task.id = ntohl(task.id);
-  task.arith = ntohl(task.arith);
-
-  int32_t h_in1 = static_cast<int32_t>(ntohl(*reinterpret_cast<uint32_t *>(&task.inValue1)));
-  int32_t h_in2 = static_cast<int32_t>(ntohl(*reinterpret_cast<uint32_t *>(&task.inValue2)));
-  double h_fl1 = task.flValue1, h_fl2 = task.flValue2;
-
-  if (task.type != 1 || task.major_version != 1 || task.minor_version != 0)
+  else if (n != sizeof(calcProtocol))
   {
-    std::cout << "ERROR WRONG SIZE OR INCORRECT PROTOCOL\n";
+    std::cerr << "ERROR WRONG SIZE OR INCORRECT PROTOCOL" << std::endl;
+    freeaddrinfo(res);
     close(sockfd);
-    freeaddrinfo(server_addr);
-    return 1;
+    return EXIT_FAILURE;
   }
 
-  bool is_float_op = task.arith >= 5 && task.arith <= 8;
-  int32_t res_int = 0;
-  double res_float = 0.0;
-  if (is_float_op)
-    res_float = compute_float(task.arith, h_fl1, h_fl2);
+  // We received calcProtocol
+  calcProtocol cp{};
+  memcpy(&cp, buffer, sizeof(calcProtocol));
+  network_to_host(cp);
+
+  std::string op;
+  switch (cp.arith)
+  {
+  case 1:
+    op = "add";
+    break;
+  case 2:
+    op = "sub";
+    break;
+  case 3:
+    op = "mul";
+    break;
+  case 4:
+    op = "div";
+    break;
+  case 5:
+    op = "fadd";
+    break;
+  case 6:
+    op = "fsub";
+    break;
+  case 7:
+    op = "fmul";
+    break;
+  case 8:
+    op = "fdiv";
+    break;
+  default:
+    op = "unknown";
+    break;
+  }
+
+  std::cout << "ASSIGNMENT: " << op << " ";
+  if (cp.arith < 5)
+    std::cout << cp.inValue1 << " " << cp.inValue2 << std::endl;
   else
-    res_int = compute_int(task.arith, h_in1, h_in2);
+    std::cout << cp.flValue1 << " " << cp.flValue2 << std::endl;
 
-  std::cout << "ASSIGNMENT: " << op_to_string(task.arith) << " ";
-  if (is_float_op)
+  calculate_result(cp);
+  DEBUG_PRINT("Calculated result to " << (cp.arith < 5 ? cp.inResult : cp.flResult));
+
+  // Convert back to network byte order for sending result
+  cp.type = htons(cp.type);
+  cp.major_version = htons(cp.major_version);
+  cp.minor_version = htons(cp.minor_version);
+  cp.id = htonl(cp.id);
+  cp.arith = htonl(cp.arith);
+  cp.inValue1 = htonl(cp.inValue1);
+  cp.inValue2 = htonl(cp.inValue2);
+  cp.inResult = htonl(cp.inResult);
+
+  attempts = 0;
+  while (attempts < 3)
   {
-    std::cout << h_fl1 << " " << h_fl2 << "\n";
-    DEBUG_PRINT("Calculated the result to %8.8g\n", res_float);
+    sendto(sockfd, &cp, sizeof(cp), 0, rp->ai_addr, rp->ai_addrlen);
+    n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
+                 (struct sockaddr *)&src_addr, &addrlen);
+    if (n < 0)
+    {
+      DEBUG_PRINT("Timeout waiting for OK/NOT OK, retrying...");
+      attempts++;
+      continue;
+    }
+    break;
   }
-  else
+
+  if (attempts == 3)
   {
-    std::cout << h_in1 << " " << h_in2 << "\n";
-    DEBUG_PRINT("Calculated the result to %d\n", res_int);
-  }
-
-  // Send calcProtocol response
-  calcProtocol response{};
-  response.type = htons(2);
-  response.major_version = htons(1);
-  response.minor_version = htons(0);
-  response.id = htonl(task.id);
-  response.arith = htonl(task.arith);
-  *reinterpret_cast<uint32_t *>(&response.inValue1) = htonl(static_cast<uint32_t>(h_in1));
-  *reinterpret_cast<uint32_t *>(&response.inValue2) = htonl(static_cast<uint32_t>(h_in2));
-  *reinterpret_cast<uint32_t *>(&response.inResult) = htonl(static_cast<uint32_t>(res_int));
-  response.flValue1 = h_fl1;
-  response.flValue2 = h_fl2;
-  response.flResult = res_float;
-
-  char response_buf[PROTO_SIZE];
-  std::memcpy(response_buf, &response, PROTO_SIZE);
-
-  size_t final_recv_size{};
-  if (send_with_timeout(sockfd, response_buf, PROTO_SIZE, recv_buf, &final_recv_size, server_addr->ai_addr, server_addr->ai_addrlen) < 0)
-  {
-    std::cout << "the server did not reply\n";
+    std::cerr << "Server did not reply after sending result." << std::endl;
+    freeaddrinfo(res);
     close(sockfd);
-    freeaddrinfo(server_addr);
-    return 1;
+    return EXIT_FAILURE;
   }
 
-  if (final_recv_size != MSG_SIZE)
+  if (n != sizeof(calcMessage))
   {
-    std::cout << "ERROR WRONG SIZE OR INCORRECT PROTOCOL\n";
+    std::cerr << "ERROR WRONG SIZE OR INCORRECT PROTOCOL" << std::endl;
+    freeaddrinfo(res);
     close(sockfd);
-    freeaddrinfo(server_addr);
-    return 1;
+    return EXIT_FAILURE;
   }
 
-  calcMessage final_resp;
-  std::memcpy(&final_resp, recv_buf, MSG_SIZE);
-  final_resp.type = ntohs(final_resp.type);
-  final_resp.message = ntohl(final_resp.message);
+  calcMessage resultMsg{};
+  memcpy(&resultMsg, buffer, sizeof(calcMessage));
+  network_to_host(resultMsg);
 
-  if (final_resp.type == 2 && final_resp.message == 1)
-  { // MSG_OK
-    std::cout << "OK (myresult=";
-    if (is_float_op)
-      std::cout << res_float;
-    else
-      std::cout << res_int;
-    std::cout << ")\n";
-  }
+  if (resultMsg.message == 1)
+    std::cout << "OK (myresult=" << (cp.arith < 5 ? cp.inResult : cp.flResult) << ")" << std::endl;
   else
-  {
-    std::cout << "the server sent a 'NOT OK' message\n";
-  }
+    std::cout << "NOT OK (myresult=" << (cp.arith < 5 ? cp.inResult : cp.flResult) << ")" << std::endl;
 
+  freeaddrinfo(res);
   close(sockfd);
-  freeaddrinfo(server_addr);
-  return 0;
+  return EXIT_SUCCESS;
 }
